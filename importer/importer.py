@@ -498,7 +498,7 @@ def parseBones(file, address, bones, useDefaultPose=False, sceneSettings=None):
     rt = Vector((0.0, 0.0, 0.0))
     pivots = [sp, st, rp, rt]
     
-    if k == 0x2:
+    if k == 0x2: # joint
         # bind pose rotation
         brx = file.read('float', address, offset=0x34)
         bry = file.read('float', 0, whence='current')
@@ -607,7 +607,9 @@ def parseModel(path, useDefaultPose=False):
         idk1 = file.read('ushort', 0x2)
         idk2 = file.read('uchar', 0x4)
 
-        sceneSettings = {'precomputedPivots': (idk < 1) or (idk1 < 3) or (idk2 == 0)}
+        notAllPrecomputedPivots = (idk < 1) or ((idk == 1) and ((idk1 < 3) or ((idk1 == 3) and (idk2 == 0))))
+
+        sceneSettings = {'precomputedPivots': not notAllPrecomputedPivots}
 
         materialsListAddr = file.read('uint', 0x14)
         numMaterials = file.read('ushort', 0x1c)
@@ -630,7 +632,11 @@ def parseModel(path, useDefaultPose=False):
         idk1 = file.read('ushort', 0x2)
         idk2 = file.read('uchar', 0x4)
 
-        sceneSettings = {'precomputedPivots': (idk < 1) or (idk1 < 3) or (idk2 == 0)}
+        notAllPrecomputedPivots = (idk < 1) or ((idk == 1) and ((idk1 < 3) or ((idk1 == 3) and (idk2 == 0))))
+
+        sceneSettings = {'precomputedPivots': not notAllPrecomputedPivots}
+
+        # sceneSettings = {'precomputedPivots': (idk < 1) or (idk1 < 3) or (idk2 == 0)}
 
         materialsListAddr = file.read('uint', 0x14)
         numMaterials = file.read('ushort', 0x1e)
@@ -745,6 +751,66 @@ def makeMesh(meshData, partData, bones):
     m.normals_split_custom_set_from_vertices(meshData.vertNormals) 
     return m
 
+def calculatePoseBoneTransforms(bone, bbone, translation, rotation, scale):
+
+    if bone.type == 2:
+        # GSjoint
+        jointOrientation = bone.bindRotation
+
+        # scale corrections for blender
+        s = bone.inverseBindMatrix.inverted().to_scale()
+        C_1 = Matrix.Diagonal((1 / s[0], 1 / s[1], 1 / s[2], 1.0))
+        
+        if bbone.parent:
+            s = bone.invparentBind.inverted().to_scale()
+            C_2 = Matrix.Diagonal((s[0], s[1], s[2], 1.0))
+
+        if bbone.parent:
+            localMatrix = np.einsum('...in,hi,nm,...mj,...j,jt->...it', translation, C_2, jointOrientation, rotation, scale, C_1, optimize='greedy')
+        else:
+            localMatrix = np.einsum('...in,nm,...mj,...j,jt->...it', translation, jointOrientation, rotation, scale, C_1, optimize='greedy')
+
+    elif (bone.type == 0 or bone.type == 3 or bone.type == 5 or bone.type == 6 or bone.type == 7):
+        # GSnull, GSmodel, GSlight, GSvolume, GSparticle
+
+        # time for maya memes
+        precomputed = (bone.RotationPivotTranslate[0] == float('inf') 
+                    or bone.RotationPivotTranslate[1] == float('inf')
+                    or bone.RotationPivotTranslate[2] == float('inf'))
+        if precomputed:
+            T_1 = bone.ScalePivot
+            T_2 = bone.ScalePivotTranslate
+            T_3 = bone.RotatePivot
+        else:
+            T_1 = -bone.ScalePivot
+            T_2 = bone.ScalePivot + bone.ScalePivotTranslate - bone.RotatePivot
+            T_3 = bone.RotatePivot + bone.RotationPivotTranslate
+
+        T_1 = Matrix.Translation(T_1)
+        T_2 = Matrix.Translation(T_2)
+        T_3 = Matrix.Translation(T_3)
+
+        localMatrix = np.einsum('...ik,kl,...lm,mt,...t,ts->...is', translation, T_3, rotation, T_2, scale, T_1, optimize='greedy')
+
+    elif bone.type == 1:
+        print(f"Bone {bone.name}: What the fuck is node type 1?")
+        return None
+    else:
+        # TODO: camera
+        print(f"Bone {bone.name}: Camera animations are currently not implemented")
+        return None
+    
+    # correct for blender applying these relative to edit mode transforms
+    if bbone.parent:
+        relativeBind = bbone.parent.bone.matrix_local.inverted() @ bbone.bone.matrix_local
+    else:
+        relativeBind = bbone.bone.matrix_local
+
+    invRelativeBind = relativeBind.inverted()
+    correctedMatrix = np.einsum('ij,...jk->...ik', invRelativeBind, localMatrix)
+    
+    return correctedMatrix
+
 def makeAction(actionData, arma, skele):
     actionNameWithQuotes = f'"{actionData["name"]}"'
     print(f'Importing Action {actionNameWithQuotes: <16} ...', end='')
@@ -854,6 +920,7 @@ def makeAction(actionData, arma, skele):
 
         # sample
         # these calculations are done manually because the blender functions are slower
+        # implements assembleSRTNumpyArrays
         rate = bpy.context.scene.render.fps / sampleFramerate
         scale = np.empty((sampleFrames, 4), dtype='float')
         translation = np.empty((sampleFrames, 4, 4), dtype='float')
@@ -886,66 +953,11 @@ def makeAction(actionData, arma, skele):
 
         times[3] = time.time()
 
-        if bone.type == 2:
+        poseMatrices = calculatePoseBoneTransforms(bone, b, translation, rotation, scale)
 
-            local = bone.localTransform
-            if b.parent:
-                relativeBind = b.parent.bone.matrix_local.inverted() @ b.bone.matrix_local
-            else:
-                relativeBind = b.bone.matrix_local
-
-            invRelativeBind = relativeBind.inverted()
-            jointOrientation = bone.bindRotation
-
-            # scale corrections for blender
-            s = bone.inverseBindMatrix.inverted().to_scale()
-            C_1 = Matrix.Diagonal((1 / s[0], 1 / s[1], 1 / s[2], 1.0))
-            
-            if b.parent:
-                s = bone.invparentBind.inverted().to_scale()
-                C_2 = Matrix.Diagonal((s[0], s[1], s[2], 1.0))
-
-            if b.parent:
-                correctedMatrix = np.einsum('...sh,hi,...in,nm,...mj,...j,jt->...st', invRelativeBind, C_2, translation, jointOrientation, rotation, scale, C_1, optimize='greedy')
-            else:
-                correctedMatrix = np.einsum('...si,...in,nm,...mj,...j,jt->...st', invRelativeBind, translation, jointOrientation, rotation, scale, C_1, optimize='greedy')
-            
-
-        elif (bone.type == 0 or bone.type == 3 or bone.type == 5 or bone.type == 6 or bone.type == 7):
-            # GSnull, GSmodel, GSlight, GSvolume, GSparticle
-
-            # time for maya memes
-            precomputed = (bone.RotationPivotTranslate[0] == float('inf') 
-                        or bone.RotationPivotTranslate[1] == float('inf')
-                        or bone.RotationPivotTranslate[2] == float('inf'))
-            if precomputed:
-                T_1 = bone.ScalePivot
-                T_2 = bone.ScalePivotTranslate
-                T_3 = bone.RotatePivot
-            else:
-                T_1 = -bone.ScalePivot
-                T_2 = bone.ScalePivot + bone.ScalePivotTranslate - bone.RotatePivot
-                T_3 = bone.RotatePivot + bone.RotationPivotTranslate
-
-            T_1 = Matrix.Translation(T_1)
-            T_2 = Matrix.Translation(T_2)
-            T_3 = Matrix.Translation(T_3)
-
-            local = bone.localTransform
-            if b.parent:
-                relativeBind = b.parent.bone.matrix_local.inverted() @ b.bone.matrix_local
-            else:
-                relativeBind = b.bone.matrix_local
-
-            invRelativeBind = relativeBind.inverted()
-
-            correctedMatrix = np.einsum('...ij,...jk,kl,...lm,mt,...t,ts->...is', invRelativeBind, translation, T_3, rotation, T_2, scale, T_1, optimize='greedy')
-
-        elif bone.type == 1:
-            print("What the fuck is node type 1?")
-        else:
-            # TODO: camera
-            print("Camera animations are currently not implemented")
+        # some types are not implemented at the moment
+        if poseMatrices is None:
+            continue
 
         times[4] = time.time()
 
@@ -957,7 +969,7 @@ def makeAction(actionData, arma, skele):
 
         for i in range(sampleFrames):
             frame = float(i * bpy.context.scene.render.fps / sampleFramerate)
-            trans, rot, scale = Matrix(correctedMatrix[i]).decompose()
+            trans, rot, scale = Matrix(poseMatrices[i]).decompose()
             rot = rot.to_euler()
 
             scales[0][2 * i + 1] = scale[0]
@@ -1009,7 +1021,7 @@ def makeAction(actionData, arma, skele):
             times[i] += durations[i]
             total += durations[i]
         
-    times = [f"{t / total * 100:3.2f}%" for t in times]
+    # times = [f"{t / total * 100:3.2f}%" for t in times]
     #print(' '.join(times))
     print(f'\rImporting Action {actionNameWithQuotes: <16} DONE!')
 
@@ -1038,6 +1050,32 @@ def makeObject(context, meshData, partData, material, bones, meshBone):
                 o.vertex_groups.new(name=name)
             o.vertex_groups[name].add([i], 1.0, 'REPLACE')
     return o
+
+def assembleSRTNumpyArrays(s, r, t):
+    scale = (s[0], s[1], s[2], 1.0)
+
+    translation = ((1.0, 0.0, 0.0, t[0]),
+                   (0.0, 1.0, 0.0, t[1]),
+                   (0.0, 0.0, 1.0, t[2]),
+                   (0.0, 0.0, 0.0, 1.0))
+
+    alpha = r[0]
+    beta = r[1]
+    gamma = r[2]
+
+    cosgamma = math.cos(gamma) 
+    singamma = math.sin(gamma)
+    cosbeta = math.cos(beta)
+    sinbeta = math.sin(beta)
+    cosalpha = math.cos(alpha)
+    sinalpha = math.sin(alpha)
+
+    rotation = ((cosbeta*cosgamma, sinalpha*sinbeta*cosgamma - cosalpha*singamma, cosalpha*sinbeta*cosgamma + sinalpha*singamma, 0.0),
+                (cosbeta*singamma, sinalpha*sinbeta*singamma + cosalpha*cosgamma, cosalpha*sinbeta*singamma - sinalpha*cosgamma, 0.0),
+                (-sinbeta,         sinalpha*cosbeta,                              cosalpha*cosbeta,                              0.0),
+                (0.0,              0.0,                                           0.0,                                           1.0))
+    
+    return np.array(scale), np.array(rotation), np.array(translation)
 
 def makeArmature_r(edit_bones, bones, boneIndex):
     boneData = bones[boneIndex]
@@ -1072,6 +1110,7 @@ def makeArmature(context, skele):
         if b.name != bone.name:
             print("DUPLICATE BONE NAME: ", b.name, " ", bone.name)
 
+        ##### fallback ####
         local = bone.localTransform
         if b.parent:
             relativeBind = b.parent.bone.matrix_local.inverted() @ b.bone.matrix_local
@@ -1087,8 +1126,14 @@ def makeArmature(context, skele):
             s = bone.invparentBind.to_scale()
             C = Matrix.Diagonal((1 / s[0], 1 / s[1], 1 / s[2], 1.0))
             local = C @ local
+        ###################
 
-        b.matrix_basis = relativeBind.inverted() @ local
+        scale, rotation, translation = assembleSRTNumpyArrays(bone.initialScale, bone.initialRot, bone.initialTrans)
+        poseMatrix = calculatePoseBoneTransforms(bone, b, translation, rotation, scale)
+        if not (poseMatrix is None): # implemented
+            b.matrix_basis = poseMatrix.transpose()
+        else:
+            b.matrix_basis = relativeBind.inverted() @ local
         b["type"] = bone.type
         b["flag"] = "{0:b}".format(bone.nodeFlags)
         b["idk1"] = hex(bone.idk1)
